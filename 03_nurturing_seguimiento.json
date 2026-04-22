@@ -1,0 +1,693 @@
+{
+  "name": "MedFlow AI — WF3: Nurturing y Seguimiento de Pacientes",
+  "nodes": [
+    {
+      "id": "webhook-nurturing",
+      "name": "Webhook: Recibe Paciente para Nurturing",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "path": "medflow/nurturing",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "Recibe pacientes con urgencia_score < 50 desde WF1. Inicia el flujo de seguimiento automatico."
+    },
+    {
+      "id": "schedule-recordatorios",
+      "name": "Schedule: Recordatorios Diarios 9:00 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 500],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1-5"
+            }
+          ]
+        }
+      },
+      "notes": "Dispara de lunes a viernes a las 9:00 AM para procesar la cola de recordatorios pendientes."
+    },
+    {
+      "id": "postgres-consulta-nuevo-paciente",
+      "name": "Postgres: Registrar en Cola Nurturing",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [480, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO nurturing_queue (\n  consulta_id,\n  patient_hash,\n  canal,\n  especialidad,\n  urgencia_score,\n  estado,\n  proximo_contacto,\n  intentos,\n  created_at\n) VALUES (\n  {{ $json.body.consulta_id }},\n  '{{ $json.body.patient_hash }}',\n  '{{ $json.body.canal }}',\n  '{{ $json.body.especialidad }}',\n  {{ $json.body.urgencia_score }},\n  'pendiente',\n  NOW() + INTERVAL '1 day',\n  0,\n  NOW()\n)\nON CONFLICT (consulta_id) DO NOTHING\nRETURNING id, consulta_id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Inserta el paciente en la cola de nurturing. ON CONFLICT evita duplicados si WF1 dispara dos veces."
+    },
+    {
+      "id": "http-respuesta-inmediata-wa",
+      "name": "HTTP: Respuesta Inmediata por WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.WHATSAPP_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "messaging_product": "whatsapp",
+          "to": "={{ $json.body.paciente_tel || '' }}",
+          "type": "template",
+          "template": {
+            "name": "medflow_bienvenida",
+            "language": { "code": "es_AR" },
+            "components": [
+              {
+                "type": "body",
+                "parameters": [
+                  { "type": "text", "text": "={{ $json.body.especialidad || 'medicina general' }}" }
+                ]
+              }
+            ]
+          }
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 2,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "notes": "Envia mensaje de bienvenida usando plantilla aprobada por Meta. Solo si el canal es WhatsApp."
+    },
+    {
+      "id": "respond-nurturing-ok",
+      "name": "Respond: Nurturing Iniciado",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [960, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, mensaje: 'Paciente agregado a nurturing', consulta_id: $json.body.consulta_id }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "postgres-cola-pendientes",
+      "name": "Postgres: Leer Cola de Recordatorios Pendientes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [480, 500],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  nq.id,\n  nq.consulta_id,\n  nq.patient_hash,\n  nq.canal,\n  nq.especialidad,\n  nq.urgencia_score,\n  nq.intentos,\n  nq.estado,\n  pc.paciente_tel,\n  pc.paciente_email,\n  pc.idioma\nFROM nurturing_queue nq\nLEFT JOIN pacientes_cache pc ON pc.patient_hash = nq.patient_hash\nWHERE nq.estado = 'pendiente'\n  AND nq.proximo_contacto <= NOW()\n  AND nq.intentos < 3\nORDER BY nq.urgencia_score DESC, nq.proximo_contacto ASC\nLIMIT 50;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Lee hasta 50 pacientes pendientes de contacto. Prioriza por score de urgencia. Maximo 3 intentos por paciente."
+    },
+    {
+      "id": "if-hay-pendientes",
+      "name": "IF: ¿Hay Pacientes Pendientes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [720, 500],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-pendientes",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "split-in-batches",
+      "name": "Split in Batches: Procesar de a 10",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [960, 460],
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "notes": "Procesa los recordatorios en lotes de 10 para no saturar las APIs de WhatsApp y email."
+    },
+    {
+      "id": "switch-canal",
+      "name": "Switch: Canal de Comunicacion",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1180, 460],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.canal }}",
+                    "rightValue": "whatsapp",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "WHATSAPP"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.canal }}",
+                    "rightValue": "email",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "EMAIL"
+            }
+          ]
+        },
+        "fallbackOutput": "extra",
+        "options": {}
+      }
+    },
+    {
+      "id": "code-generar-mensaje-wa",
+      "name": "Code: Generar Mensaje Personalizado WA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1400, 340],
+      "parameters": {
+        "jsCode": "const paciente = $json;\nconst intento = paciente.intentos + 1;\n\n// Mensajes progresivos segun numero de intento\nconst mensajes = [\n  `Hola! Te contactamos desde la clinica. Notamos que tuviste una consulta sobre *${paciente.especialidad}*. ¿Pudiste resolver tu duda? Podemos ayudarte a sacar un turno. Responde SI para continuar o NO si ya estas atendido.`,\n  `Seguimos a tu disposicion para tu consulta de *${paciente.especialidad}*. Nuestros profesionales tienen disponibilidad esta semana. ¿Te gustaria coordinar un turno? Responde TURNO para ver horarios disponibles.`,\n  `Ultimo recordatorio: si necesitas atencion medica en *${paciente.especialidad}*, estamos aqui para ayudarte. Llama al {{$env.CLINICA_TEL}} o responde TURNO para gestionar tu cita. ¡Que te cuides!`\n];\n\nconst mensaje = mensajes[Math.min(intento - 1, 2)];\n\nreturn [{\n  json: {\n    ...paciente,\n    mensaje_texto: mensaje,\n    intento_actual: intento\n  }\n}];"
+      }
+    },
+    {
+      "id": "http-wa-recordatorio",
+      "name": "HTTP: Enviar Recordatorio por WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 340],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.WHATSAPP_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "messaging_product": "whatsapp",
+          "to": "={{ $json.paciente_tel }}",
+          "type": "text",
+          "text": {
+            "body": "={{ $json.mensaje_texto }}"
+          }
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 2,
+            "waitBetweenTries": 3000
+          }
+        }
+      }
+    },
+    {
+      "id": "http-email-recordatorio",
+      "name": "HTTP: Enviar Recordatorio por Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1400, 580],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SENDGRID_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "personalizations": [
+            {
+              "to": [{ "email": "={{ $json.paciente_email }}" }],
+              "dynamic_template_data": {
+                "especialidad": "={{ $json.especialidad }}",
+                "intento": "={{ $json.intentos + 1 }}",
+                "link_turno": "={{ $env.PORTAL_URL }}/turno?ref={{ $json.patient_hash }}"
+              }
+            }
+          ],
+          "from": { "email": "turnos@medflow.ai", "name": "MedFlow AI — Clinica" },
+          "template_id": "={{ $env.SENDGRID_TEMPLATE_RECORDATORIO }}"
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 2,
+            "waitBetweenTries": 3000
+          }
+        }
+      },
+      "notes": "Usa template dinamico de SendGrid. El link de turno contiene solo el hash del paciente (sin PII en la URL)."
+    },
+    {
+      "id": "merge-enviados",
+      "name": "Merge: Unificar Enviados",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1840, 460],
+      "parameters": {
+        "mode": "passThrough",
+        "output": "input1"
+      }
+    },
+    {
+      "id": "postgres-actualizar-cola",
+      "name": "Postgres: Actualizar Estado en Cola",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2060, 460],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE nurturing_queue\nSET \n  intentos = intentos + 1,\n  ultimo_contacto = NOW(),\n  proximo_contacto = CASE\n    WHEN intentos + 1 >= 3 THEN NULL\n    ELSE NOW() + INTERVAL '3 days'\n  END,\n  estado = CASE\n    WHEN intentos + 1 >= 3 THEN 'completado'\n    ELSE 'pendiente'\n  END\nWHERE consulta_id = {{ $json.consulta_id }}\nRETURNING id, consulta_id, estado, intentos;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Actualiza intentos y programa el proximo contacto en 3 dias. Al 3er intento marca como 'completado'."
+    },
+    {
+      "id": "if-respondio-si",
+      "name": "IF: ¿Paciente Respondio Interes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2280, 460],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-si",
+              "leftValue": "={{ $json.estado }}",
+              "rightValue": "interesado",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "El estado 'interesado' se setea desde el webhook de respuesta de WhatsApp (si el paciente responde SI o TURNO)."
+    },
+    {
+      "id": "http-activar-wf2-turno",
+      "name": "HTTP: Activar WF2 para Agendar Turno",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2500, 380],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_BASE_URL }}/webhook/medflow/rag-consulta",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "consulta_id": "={{ $json.consulta_id }}",
+          "texto": "=El paciente desea sacar un turno de {{ $json.especialidad }}. Ayudalo a coordinar la cita.",
+          "canal": "={{ $json.canal }}",
+          "especialidad": "={{ $json.especialidad }}",
+          "urgencia_score": 55,
+          "patient_hash": "={{ $json.patient_hash }}",
+          "contexto": "nurturing_conversion"
+        },
+        "options": {}
+      },
+      "notes": "Cuando el paciente muestra interes, lo re-enruta al WF2 para que el asistente IA gestione el turno."
+    },
+    {
+      "id": "postgres-log-nurturing",
+      "name": "Postgres: Log de Actividad Nurturing",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2500, 540],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO execution_logs (\n  patient_hash, canal, consulta_id,\n  workflow_id, event_type,\n  metadata, timestamp\n) VALUES (\n  '{{ $json.patient_hash }}',\n  '{{ $json.canal }}',\n  {{ $json.consulta_id }},\n  'WF3',\n  'nurturing_contacto_enviado',\n  '{\"intento\": {{ $json.intentos }}, \"estado\": \"{{ $json.estado }}\"}',\n  NOW()\n);",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "webhook-respuesta-paciente",
+      "name": "Webhook: Respuesta del Paciente (SI/TURNO)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 720],
+      "parameters": {
+        "path": "medflow/nurturing-respuesta",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "Recibe la respuesta del paciente cuando contesta SI, TURNO o NO al mensaje de WhatsApp."
+    },
+    {
+      "id": "code-detectar-intencion",
+      "name": "Code: Detectar Intencion de Respuesta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 720],
+      "parameters": {
+        "jsCode": "const body = $json.body || $json;\nconst texto = (body.texto || body.message || '').toLowerCase().trim();\n\n// Detectar intencion del paciente\nconst interesado = ['si', 'sí', 'turno', 'quiero', 'yes', 'ok', 'dale', 'quiero turno', 'me interesa'];\nconst noInteresado = ['no', 'nope', 'no gracias', 'ya fui', 'ya me atendi', 'cancel', 'cancelar', 'baja', 'stop'];\n\nlet intencion = 'indefinida';\nif (interesado.some(k => texto.includes(k))) intencion = 'interesado';\nelse if (noInteresado.some(k => texto.includes(k))) intencion = 'no_interesado';\n\nreturn [{\n  json: {\n    patient_hash: body.patient_hash,\n    consulta_id: body.consulta_id,\n    canal: body.canal || 'whatsapp',\n    especialidad: body.especialidad,\n    texto_respuesta: texto,\n    intencion\n  }\n}];"
+      }
+    },
+    {
+      "id": "switch-intencion",
+      "name": "Switch: Accion segun Intencion",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [720, 720],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intencion }}",
+                    "rightValue": "interesado",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "INTERESADO"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intencion }}",
+                    "rightValue": "no_interesado",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "NO_INTERESADO"
+            }
+          ]
+        },
+        "fallbackOutput": "extra",
+        "options": {}
+      }
+    },
+    {
+      "id": "postgres-marcar-interesado",
+      "name": "Postgres: Marcar como Interesado",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [960, 640],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE nurturing_queue\nSET estado = 'interesado', ultimo_contacto = NOW()\nWHERE consulta_id = {{ $json.consulta_id }}\nRETURNING *;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "http-wf2-desde-respuesta",
+      "name": "HTTP: Enviar a WF2 para Gestionar Turno",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 640],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_BASE_URL }}/webhook/medflow/rag-consulta",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "consulta_id": "={{ $json.consulta_id }}",
+          "texto": "=Deseo sacar un turno de {{ $json.especialidad }}.",
+          "canal": "={{ $json.canal }}",
+          "especialidad": "={{ $json.especialidad }}",
+          "urgencia_score": 55,
+          "patient_hash": "={{ $json.patient_hash }}",
+          "contexto": "respuesta_nurturing_positiva"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "postgres-marcar-baja",
+      "name": "Postgres: Marcar como No Interesado",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [960, 800],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE nurturing_queue\nSET estado = 'baja_voluntaria', ultimo_contacto = NOW()\nWHERE consulta_id = {{ $json.consulta_id }}\nRETURNING consulta_id, estado;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Respeta la decision del paciente de no ser contactado. Cumplimiento Ley 25326 derecho de exclusion."
+    },
+    {
+      "id": "http-wa-despedida",
+      "name": "HTTP: Mensaje de Cierre Respetuoso",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 800],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.WHATSAPP_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "messaging_product": "whatsapp",
+          "to": "={{ $json.paciente_tel || '' }}",
+          "type": "text",
+          "text": {
+            "body": "Entendido, no te molestaremos mas. Si en el futuro necesitas atencion medica, estamos a tu disposicion. ¡Que te cuides mucho!"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "respond-respuesta-ok",
+      "name": "Respond: Respuesta Procesada",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1440, 720],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, intencion: $json.intencion }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "error-trigger-wf3",
+      "name": "Error Trigger WF3",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 940],
+      "parameters": {}
+    },
+    {
+      "id": "postgres-error-wf3",
+      "name": "Postgres: Log Error WF3",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [480, 940],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_queue (workflow_id, error_message, payload, created_at)\nVALUES ('WF3', '{{ $json.error.message }}', '{{ JSON.stringify($json).substring(0, 1000) }}', NOW());",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: Recibe Paciente para Nurturing": {
+      "main": [[{ "node": "Postgres: Registrar en Cola Nurturing", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Registrar en Cola Nurturing": {
+      "main": [[{ "node": "HTTP: Respuesta Inmediata por WhatsApp", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Respuesta Inmediata por WhatsApp": {
+      "main": [[{ "node": "Respond: Nurturing Iniciado", "type": "main", "index": 0 }]]
+    },
+    "Schedule: Recordatorios Diarios 9:00 AM": {
+      "main": [[{ "node": "Postgres: Leer Cola de Recordatorios Pendientes", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Leer Cola de Recordatorios Pendientes": {
+      "main": [[{ "node": "IF: ¿Hay Pacientes Pendientes?", "type": "main", "index": 0 }]]
+    },
+    "IF: ¿Hay Pacientes Pendientes?": {
+      "main": [
+        [{ "node": "Split in Batches: Procesar de a 10", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Split in Batches: Procesar de a 10": {
+      "main": [[{ "node": "Switch: Canal de Comunicacion", "type": "main", "index": 0 }]]
+    },
+    "Switch: Canal de Comunicacion": {
+      "main": [
+        [{ "node": "Code: Generar Mensaje Personalizado WA", "type": "main", "index": 0 }],
+        [{ "node": "HTTP: Enviar Recordatorio por Email", "type": "main", "index": 0 }],
+        [{ "node": "Code: Generar Mensaje Personalizado WA", "type": "main", "index": 0 }]
+      ]
+    },
+    "Code: Generar Mensaje Personalizado WA": {
+      "main": [[{ "node": "HTTP: Enviar Recordatorio por WhatsApp", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Enviar Recordatorio por WhatsApp": {
+      "main": [[{ "node": "Merge: Unificar Enviados", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Enviar Recordatorio por Email": {
+      "main": [[{ "node": "Merge: Unificar Enviados", "type": "main", "index": 1 }]]
+    },
+    "Merge: Unificar Enviados": {
+      "main": [[{ "node": "Postgres: Actualizar Estado en Cola", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Actualizar Estado en Cola": {
+      "main": [
+        [{ "node": "IF: ¿Paciente Respondio Interes?", "type": "main", "index": 0 }],
+        [{ "node": "Postgres: Log de Actividad Nurturing", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF: ¿Paciente Respondio Interes?": {
+      "main": [
+        [{ "node": "HTTP: Activar WF2 para Agendar Turno", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Webhook: Respuesta del Paciente (SI/TURNO)": {
+      "main": [[{ "node": "Code: Detectar Intencion de Respuesta", "type": "main", "index": 0 }]]
+    },
+    "Code: Detectar Intencion de Respuesta": {
+      "main": [[{ "node": "Switch: Accion segun Intencion", "type": "main", "index": 0 }]]
+    },
+    "Switch: Accion segun Intencion": {
+      "main": [
+        [{ "node": "Postgres: Marcar como Interesado", "type": "main", "index": 0 }],
+        [{ "node": "Postgres: Marcar como No Interesado", "type": "main", "index": 0 }],
+        [{ "node": "Respond: Respuesta Procesada", "type": "main", "index": 0 }]
+      ]
+    },
+    "Postgres: Marcar como Interesado": {
+      "main": [[{ "node": "HTTP: Enviar a WF2 para Gestionar Turno", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Enviar a WF2 para Gestionar Turno": {
+      "main": [[{ "node": "Respond: Respuesta Procesada", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Marcar como No Interesado": {
+      "main": [[{ "node": "HTTP: Mensaje de Cierre Respetuoso", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Mensaje de Cierre Respetuoso": {
+      "main": [[{ "node": "Respond: Respuesta Procesada", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger WF3": {
+      "main": [[{ "node": "Postgres: Log Error WF3", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["medflow", "healthcare", "nurturing", "seguimiento", "whatsapp"],
+  "meta": {
+    "description": "MedFlow AI — WF3: Nurturing y Seguimiento. Cola Postgres con prioridad por score. Schedule lunes-viernes 9AM. Split in Batches de 10. Mensajes progresivos por intento (1/2/3). Switch WhatsApp/Email. Webhook de respuesta del paciente con deteccion de intencion. Baja voluntaria respeta Ley 25326.",
+    "templateVersion": "1.0"
+  }
+}
