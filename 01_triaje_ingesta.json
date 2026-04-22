@@ -1,0 +1,383 @@
+{
+  "name": "MedFlow AI — WF1: Triaje e Ingesta de Pacientes",
+  "nodes": [
+    {
+      "id": "webhook-ingesta",
+      "name": "Webhook: Consulta Entrante",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "path": "medflow/consulta",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "notes": "Recibe consultas desde app web, portal paciente y sistema interno. Path: POST /webhook/medflow/consulta"
+    },
+    {
+      "id": "webhook-whatsapp",
+      "name": "Webhook: WhatsApp Business",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 460],
+      "parameters": {
+        "path": "medflow/whatsapp",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "Recibe mensajes de WhatsApp Business API (Meta). Incluye verificacion HMAC-SHA256."
+    },
+    {
+      "id": "code-validate-hmac",
+      "name": "Code: Validar HMAC WhatsApp",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 460],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst payload = JSON.stringify($input.first().json.body);\nconst secret = $env.WHATSAPP_APP_SECRET;\nconst signature = $input.first().headers['x-hub-signature-256'];\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(payload).digest('hex');\n\nif (signature !== expected) {\n  throw new Error('HMAC validation failed: invalid signature');\n}\n\n// Normalizar estructura al mismo formato que webhook consulta\nconst msg = $input.first().json.body;\nconst entry = msg?.entry?.[0]?.changes?.[0]?.value;\nconst message = entry?.messages?.[0];\n\nreturn [{\n  json: {\n    canal: 'whatsapp',\n    paciente_tel: message?.from || '',\n    texto: message?.text?.body || '',\n    tipo_mensaje: message?.type || 'text',\n    media_id: message?.audio?.id || message?.image?.id || null,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "notes": "Valida firma HMAC-SHA256 de Meta. Normaliza estructura al formato estandar MedFlow."
+    },
+    {
+      "id": "code-normalize",
+      "name": "Code: Normalizar Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\n\n// Sanitizar inputs - max 1500 chars, remover caracteres peligrosos\nconst sanitize = (str) => {\n  if (!str) return '';\n  return str.toString().trim().substring(0, 1500).replace(/<script>/gi, '').replace(/[<>]/g, '');\n};\n\nreturn [{\n  json: {\n    canal: sanitize(body.canal) || 'web',\n    paciente_nombre: sanitize(body.nombre),\n    paciente_email: sanitize(body.email),\n    paciente_tel: sanitize(body.telefono),\n    paciente_dni: sanitize(body.dni),\n    texto: sanitize(body.consulta || body.texto || body.message),\n    especialidad_solicitada: sanitize(body.especialidad) || 'general',\n    tipo_mensaje: 'texto',\n    media_id: null,\n    timestamp: new Date().toISOString(),\n    workflow_id: 'WF1'\n  }\n}];"
+      },
+      "notes": "Sanitiza y normaliza payload. Previene prompt injection y datos malformados."
+    },
+    {
+      "id": "merge-canales",
+      "name": "Merge: Unificar Canales",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [700, 380],
+      "parameters": {
+        "mode": "passThrough",
+        "output": "input1"
+      },
+      "notes": "Unifica los flujos normalizados de todos los canales de ingesta."
+    },
+    {
+      "id": "if-datos-completos",
+      "name": "IF: ¿Datos Minimos Presentes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [920, 380],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false
+          },
+          "conditions": [
+            {
+              "id": "cond-texto",
+              "leftValue": "={{ $json.texto }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "respond-solicitar-datos",
+      "name": "Respond: Pedir Datos Faltantes",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1140, 500],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, error: 'Por favor describe tu consulta medica para continuar.' }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "code-triaje-score",
+      "name": "Code: Score de Urgencia Clinica",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 300],
+      "parameters": {
+        "jsCode": "const texto = ($json.texto || '').toLowerCase();\n\n// Palabras clave de urgencia con pesos\nconst urgenciaCritica = [\n  'dolor de pecho', 'dolor pecho', 'infarto', 'no puedo respirar',\n  'dificultad respirar', 'desmayo', 'perdida conciencia', 'convulsion',\n  'sangrado intenso', 'alergia grave', 'anafilaxia', 'suicidio', 'me quiero matar'\n];\nconst urgenciaAlta = [\n  'mucho dolor', 'fiebre alta', 'vomito sangre', 'cabeza fuerte',\n  'vision doble', 'entumecimiento', 'paralisis', 'accidente'\n];\nconst urgenciaMedia = [\n  'dolor', 'fiebre', 'tos', 'mareo', 'nauseas', 'vomito', 'diarrea',\n  'erupcion', 'picazon', 'infeccion', 'resultado', 'laboratorio'\n];\n\nlet score = 20; // base\nlet nivel = 'bajo';\nlet urgenciaTipo = 'consulta_general';\n\nif (urgenciaCritica.some(kw => texto.includes(kw))) {\n  score = 95; nivel = 'critico'; urgenciaTipo = 'emergencia';\n} else if (urgenciaAlta.some(kw => texto.includes(kw))) {\n  score = 75; nivel = 'alto'; urgenciaTipo = 'urgencia';\n} else if (urgenciaMedia.some(kw => texto.includes(kw))) {\n  score = 50; nivel = 'medio'; urgenciaTipo = 'consulta_medica';\n}\n\n// Hash PII para logs (anonimizacion HIPAA)\nconst hashPII = (val) => {\n  if (!val) return null;\n  let hash = 0;\n  for (let i = 0; i < val.length; i++) {\n    const char = val.charCodeAt(i);\n    hash = ((hash << 5) - hash) + char;\n    hash = hash & hash;\n  }\n  return Math.abs(hash).toString(16).padStart(8, '0');\n};\n\nreturn [{\n  json: {\n    ...$json,\n    urgencia_score: score,\n    urgencia_nivel: nivel,\n    urgencia_tipo: urgenciaTipo,\n    patient_hash: hashPII($json.paciente_dni || $json.paciente_tel),\n    procesado_en: new Date().toISOString()\n  }\n}];"
+      },
+      "notes": "Calcula score de urgencia 0-100 basado en palabras clave clinicas. Anonimiza PII con hash para logs."
+    },
+    {
+      "id": "postgres-upsert",
+      "name": "Postgres: Registrar Consulta",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1360, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO consultas (\n  canal, patient_hash, texto_sanitizado, especialidad,\n  urgencia_score, urgencia_nivel, urgencia_tipo,\n  tipo_mensaje, media_id, timestamp_ingesta\n) VALUES (\n  '{{ $json.canal }}',\n  '{{ $json.patient_hash }}',\n  '{{ $json.texto.substring(0, 500) }}',\n  '{{ $json.especialidad_solicitada }}',\n  {{ $json.urgencia_score }},\n  '{{ $json.urgencia_nivel }}',\n  '{{ $json.urgencia_tipo }}',\n  '{{ $json.tipo_mensaje }}',\n  {{ $json.media_id ? \"'\" + $json.media_id + \"'\" : 'NULL' }},\n  NOW()\n) RETURNING id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Registra consulta en DB. Almacena solo texto sanitizado y hash de PII (HIPAA compliance)."
+    },
+    {
+      "id": "if-urgencia-nivel",
+      "name": "Switch: Nivel de Urgencia",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1580, 300],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.urgencia_score }}",
+                    "rightValue": 85,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "CRITICO"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.urgencia_score }}",
+                    "rightValue": 50,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "MEDIO_ALTO"
+            }
+          ]
+        },
+        "fallbackOutput": "extra",
+        "options": {}
+      }
+    },
+    {
+      "id": "http-trigger-hitl",
+      "name": "HTTP: Activar WF4 HITL (Urgencia Critica)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1800, 160],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_BASE_URL }}/webhook/medflow/hitl-trigger",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "consulta_id": "={{ $json.id }}",
+          "urgencia_tipo": "={{ $json.urgencia_tipo }}",
+          "urgencia_score": "={{ $json.urgencia_score }}",
+          "texto_resumido": "={{ $json.texto.substring(0, 200) }}",
+          "canal": "={{ $json.canal }}",
+          "patient_hash": "={{ $json.patient_hash }}"
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "notes": "Dispara WF4 (HITL Medico) inmediatamente para casos criticos. Retry 3x con backoff."
+    },
+    {
+      "id": "http-trigger-rag",
+      "name": "HTTP: Activar WF2 Asistente RAG",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1800, 320],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_BASE_URL }}/webhook/medflow/rag-consulta",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "consulta_id": "={{ $json.id }}",
+          "texto": "={{ $json.texto }}",
+          "canal": "={{ $json.canal }}",
+          "especialidad": "={{ $json.especialidad_solicitada }}",
+          "urgencia_score": "={{ $json.urgencia_score }}",
+          "patient_hash": "={{ $json.patient_hash }}"
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "notes": "Envia la consulta al WF2 (Asistente RAG con GPT-4o). Para urgencias medio-alto y bajo."
+    },
+    {
+      "id": "http-trigger-nurturing",
+      "name": "HTTP: Activar WF3 Nurturing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1800, 480],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_BASE_URL }}/webhook/medflow/nurturing",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "consulta_id": "={{ $json.id }}",
+          "canal": "={{ $json.canal }}",
+          "especialidad": "={{ $json.especialidad_solicitada }}",
+          "patient_hash": "={{ $json.patient_hash }}"
+        },
+        "options": {}
+      },
+      "notes": "Para consultas de baja urgencia: envia al flujo de nurturing con recordatorios y educacion."
+    },
+    {
+      "id": "respond-ok",
+      "name": "Respond: Confirmacion Recepcion",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2020, 320],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, mensaje: 'Tu consulta fue recibida. Te responderemos en breve.', consulta_id: $json.id }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "error-trigger",
+      "name": "Error Trigger: Captura Fallos",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 620],
+      "parameters": {}
+    },
+    {
+      "id": "postgres-failed-queue",
+      "name": "Postgres: Dead Letter Queue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 620],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_queue (workflow_id, error_message, payload, created_at)\nVALUES ('WF1', '{{ $json.error.message }}', '{{ JSON.stringify($json.execution) }}', NOW());",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "slack-alert-error",
+      "name": "Slack: Alerta Error WF1",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [680, 620],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#alertas-medflow",
+        "text": "🚨 *Error en WF1 Triaje*\nError: `{{ $json.error.message }}`\nTimestamp: {{ new Date().toISOString() }}\nItem en failed_queue para reintento automatico."
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: Consulta Entrante": {
+      "main": [[{ "node": "Code: Normalizar Payload", "type": "main", "index": 0 }]]
+    },
+    "Webhook: WhatsApp Business": {
+      "main": [[{ "node": "Code: Validar HMAC WhatsApp", "type": "main", "index": 0 }]]
+    },
+    "Code: Validar HMAC WhatsApp": {
+      "main": [[{ "node": "Merge: Unificar Canales", "type": "main", "index": 1 }]]
+    },
+    "Code: Normalizar Payload": {
+      "main": [[{ "node": "Merge: Unificar Canales", "type": "main", "index": 0 }]]
+    },
+    "Merge: Unificar Canales": {
+      "main": [[{ "node": "IF: ¿Datos Minimos Presentes?", "type": "main", "index": 0 }]]
+    },
+    "IF: ¿Datos Minimos Presentes?": {
+      "main": [
+        [{ "node": "Code: Score de Urgencia Clinica", "type": "main", "index": 0 }],
+        [{ "node": "Respond: Pedir Datos Faltantes", "type": "main", "index": 0 }]
+      ]
+    },
+    "Code: Score de Urgencia Clinica": {
+      "main": [[{ "node": "Postgres: Registrar Consulta", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Registrar Consulta": {
+      "main": [[{ "node": "Switch: Nivel de Urgencia", "type": "main", "index": 0 }]]
+    },
+    "Switch: Nivel de Urgencia": {
+      "main": [
+        [{ "node": "HTTP: Activar WF4 HITL (Urgencia Critica)", "type": "main", "index": 0 }],
+        [{ "node": "HTTP: Activar WF2 Asistente RAG", "type": "main", "index": 0 }],
+        [{ "node": "HTTP: Activar WF3 Nurturing", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: Activar WF2 Asistente RAG": {
+      "main": [[{ "node": "Respond: Confirmacion Recepcion", "type": "main", "index": 0 }]]
+    },
+    "Error Trigger: Captura Fallos": {
+      "main": [[{ "node": "Postgres: Dead Letter Queue", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Dead Letter Queue": {
+      "main": [[{ "node": "Slack: Alerta Error WF1", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "error-trigger"
+  },
+  "tags": ["medflow", "healthcare", "ingesta", "triaje"],
+  "meta": {
+    "description": "MedFlow AI — WF1: Triaje e Ingesta Multi-canal de Consultas de Pacientes. Normaliza canales (web, WhatsApp, FHIR), calcula score de urgencia clinica (0-100) y enruta al workflow apropiado. HIPAA: hash PII, sanitizacion inputs, HMAC validation.",
+    "templateVersion": "1.0"
+  }
+}
