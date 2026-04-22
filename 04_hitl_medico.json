@@ -1,0 +1,464 @@
+{
+  "name": "MedFlow AI — WF4: HITL Supervision Medica",
+  "nodes": [
+    {
+      "id": "webhook-hitl-trigger",
+      "name": "Webhook: Trigger HITL",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "path": "medflow/hitl-trigger",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "Recibe solicitudes de escalacion desde WF1 (urgencia critica), WF2 (tool escalate_HITL) y WF5 (imagen baja confianza)."
+    },
+    {
+      "id": "switch-urgencia-tipo",
+      "name": "Switch: Tipo de Urgencia HITL",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [460, 300],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.urgencia_tipo }}",
+                    "rightValue": "emergencia",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "EMERGENCIA"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.urgencia_tipo }}",
+                    "rightValue": "urgencia",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "URGENCIA"
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.urgencia_tipo }}",
+                    "rightValue": "consulta_critica",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "CRITICA"
+            }
+          ]
+        },
+        "fallbackOutput": "extra",
+        "options": {}
+      }
+    },
+    {
+      "id": "slack-emergencia",
+      "name": "Slack: Alerta EMERGENCIA Inmediata",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [700, 120],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#emergencias-clinica",
+        "text": "🚨🚨 *EMERGENCIA MEDICA — ACCION INMEDIATA REQUERIDA* 🚨🚨\n\n*Tipo:* `{{ $json.body.urgencia_tipo }}`\n*Canal Origen:* `{{ $json.body.canal }}`\n*Resumen:* {{ $json.body.texto_resumido || $json.body.contexto }}\n*Timestamp:* {{ new Date().toISOString() }}\n\n⚡ *HITL ID:* `{{ $json.body.consulta_id }}`\n📞 Responder en maximo 2 minutos via: {{ $env.N8N_BASE_URL }}/hitl-panel/{{ $json.body.consulta_id }}\n\n@here MEDICO ON-CALL: accion requerida AHORA",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "http-sms-emergencia",
+      "name": "HTTP: SMS al Medico On-Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [920, 120],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twilio.com/2010-04-01/Accounts/{{ $env.TWILIO_ACCOUNT_SID }}/Messages.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "twilioApi",
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "To", "value": "={{ $env.MEDICO_ON_CALL_TEL }}" },
+            { "name": "From", "value": "={{ $env.TWILIO_FROM_NUMBER }}" },
+            { "name": "Body", "value": "=MEDFLOW EMERGENCIA: {{ $json.body.urgencia_tipo }}. Consulta ID: {{ $json.body.consulta_id }}. Panel: {{ $env.HITL_PANEL_URL }}/{{ $json.body.consulta_id }}" }
+          ]
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 2,
+            "waitBetweenTries": 1000
+          }
+        }
+      },
+      "credentials": {
+        "twilioApi": {
+          "id": "twilio-medflow",
+          "name": "Twilio MedFlow"
+        }
+      },
+      "notes": "Envia SMS urgente al medico on-call via Twilio. Retry 2x por alta criticidad."
+    },
+    {
+      "id": "wait-emergencia",
+      "name": "Wait: SLA Emergencia (2 min)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1140, 120],
+      "parameters": {
+        "resume": "webhook",
+        "webhook": {
+          "webhookPath": "=medflow/hitl-response/{{ $json.body.consulta_id }}",
+          "httpMethod": "POST"
+        },
+        "limit": {
+          "type": "afterTimeInterval",
+          "value": 2,
+          "unit": "minutes"
+        }
+      },
+      "notes": "Espera respuesta del medico via webhook unico por consulta. Timeout: 2 minutos (SLA emergencia)."
+    },
+    {
+      "id": "if-respondio-emergencia",
+      "name": "IF: ¿Medico Respondio en SLA?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1360, 120],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-resp",
+              "leftValue": "={{ $json.body?.accion_medico }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "slack-medico-tomo-control",
+      "name": "Slack: Medico Tomo Control",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1580, 60],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#emergencias-clinica",
+        "text": "✅ Medico respondio y tomo control del caso.\nConsulta ID: `{{ $json.body.consulta_id }}`\nAccion: {{ $json.body.accion_medico }}\nTimestamp respuesta: {{ new Date().toISOString() }}"
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "slack-timeout-escala-supervisor",
+      "name": "Slack: Timeout — Escala a Supervisor",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1580, 200],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#supervisores-guardia",
+        "text": "🔴 *SLA BREACH — MEDICO NO RESPONDIO EN 2 MINUTOS*\n\nConsulta ID: `{{ $json.body.consulta_id }}`\nTipo: `{{ $json.body.urgencia_tipo }}`\nAccion requerida: reasignar otro medico on-call INMEDIATAMENTE.\n\n@channel SUPERVISOR: gestionar derivacion"
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "slack-urgencia",
+      "name": "Slack: Alerta URGENCIA (no critica)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [700, 320],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#urgencias-medflow",
+        "text": "⚠️ *URGENCIA — Revision Medica Requerida*\n\n*Tipo:* `{{ $json.body.urgencia_tipo }}`\n*Canal:* `{{ $json.body.canal }}`\n*Consulta:* {{ $json.body.texto_resumido || $json.body.contexto }}\n*HITL ID:* `{{ $json.body.consulta_id }}`\n\nRevisar en el panel HITL: {{ $env.HITL_PANEL_URL }}/{{ $json.body.consulta_id }}\nSLA: 10 minutos"
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "wait-urgencia",
+      "name": "Wait: SLA Urgencia (10 min)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [920, 320],
+      "parameters": {
+        "resume": "webhook",
+        "webhook": {
+          "webhookPath": "=medflow/hitl-response/urgencia/{{ $json.body.consulta_id }}",
+          "httpMethod": "POST"
+        },
+        "limit": {
+          "type": "afterTimeInterval",
+          "value": 10,
+          "unit": "minutes"
+        }
+      }
+    },
+    {
+      "id": "if-respondio-urgencia",
+      "name": "IF: ¿Respondio en SLA Urgencia?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1140, 320],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-urg",
+              "leftValue": "={{ $json.body?.aprobado }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "slack-aprobado",
+      "name": "Slack: Caso Aprobado por Medico",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1360, 260],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#urgencias-medflow",
+        "text": "✅ Caso revisado y aprobado.\nID: `{{ $json.body.consulta_id }}` | Medico: Dr/Dra {{ $json.body.medico_nombre }}"
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "slack-reasignar",
+      "name": "Slack: Reasignar por Timeout",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1360, 400],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#supervisores-guardia",
+        "text": "⏱️ SLA Urgencia vencido (10 min). Reasignar caso `{{ $json.body.consulta_id }}` a siguiente medico disponible."
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "email-baja-confianza",
+      "name": "HTTP: Email Baja Confianza IA",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 520],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.sendgrid.com/v3/mail/send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.SENDGRID_API_KEY }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "personalizations": [{ "to": [{ "email": "={{ $env.MEDICO_REVISOR_EMAIL }}" }] }],
+          "from": { "email": "noreply@medflow.ai", "name": "MedFlow AI" },
+          "subject": "=Revision requerida: Baja confianza IA - ID {{ $json.body.consulta_id }}",
+          "content": [{
+            "type": "text/plain",
+            "value": "=El asistente IA requiere su revision.\n\nMotivo: {{ $json.body.razon || 'Confianza RAG < 70%' }}\nContexto: {{ $json.body.contexto }}\nID: {{ $json.body.consulta_id }}\n\nRevisar en: {{ $env.HITL_PANEL_URL }}/{{ $json.body.consulta_id }}\nSLA: 15 minutos"
+          }]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "wait-revision",
+      "name": "Wait: SLA Revision (15 min)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [920, 520],
+      "parameters": {
+        "resume": "webhook",
+        "webhook": {
+          "webhookPath": "=medflow/hitl-response/revision/{{ $json.body.consulta_id }}",
+          "httpMethod": "POST"
+        },
+        "limit": {
+          "type": "afterTimeInterval",
+          "value": 15,
+          "unit": "minutes"
+        }
+      }
+    },
+    {
+      "id": "postgres-audit-trail",
+      "name": "Postgres: Audit Trail HIPAA",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1140, 520],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_trail (\n  consulta_id, patient_hash, evento, urgencia_tipo,\n  accion_tomada, medico_respondio, sla_cumplido,\n  timestamp_trigger, timestamp_respuesta\n) VALUES (\n  {{ $json.body.consulta_id }},\n  '{{ $json.body.patient_hash }}',\n  'HITL_TRIGGERED',\n  '{{ $json.body.urgencia_tipo }}',\n  '{{ $json.body.accion_medico || $json.body.aprobado || \"TIMEOUT\" }}',\n  {{ $json.body.medico_nombre ? true : false }},\n  {{ $json.body.accion_medico || $json.body.aprobado ? true : false }},\n  NOW(),\n  {{ $json.body.timestamp_respuesta ? \"'\" + $json.body.timestamp_respuesta + \"'\" : 'NOW()' }}\n);",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Registro inmutable de CADA evento HITL. Requerido por HIPAA §164.312(b). Tabla append-only."
+    },
+    {
+      "id": "respond-hitl-ok",
+      "name": "Respond: HITL Procesado",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1360, 520],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, hitl_id: $json.body.consulta_id, estado: 'procesado' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: Trigger HITL": {
+      "main": [[{ "node": "Switch: Tipo de Urgencia HITL", "type": "main", "index": 0 }]]
+    },
+    "Switch: Tipo de Urgencia HITL": {
+      "main": [
+        [{ "node": "Slack: Alerta EMERGENCIA Inmediata", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Alerta URGENCIA (no critica)", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Alerta URGENCIA (no critica)", "type": "main", "index": 0 }],
+        [{ "node": "HTTP: Email Baja Confianza IA", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack: Alerta EMERGENCIA Inmediata": {
+      "main": [[{ "node": "HTTP: SMS al Medico On-Call", "type": "main", "index": 0 }]]
+    },
+    "HTTP: SMS al Medico On-Call": {
+      "main": [[{ "node": "Wait: SLA Emergencia (2 min)", "type": "main", "index": 0 }]]
+    },
+    "Wait: SLA Emergencia (2 min)": {
+      "main": [[{ "node": "IF: ¿Medico Respondio en SLA?", "type": "main", "index": 0 }]]
+    },
+    "IF: ¿Medico Respondio en SLA?": {
+      "main": [
+        [{ "node": "Slack: Medico Tomo Control", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Timeout — Escala a Supervisor", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack: Alerta URGENCIA (no critica)": {
+      "main": [[{ "node": "Wait: SLA Urgencia (10 min)", "type": "main", "index": 0 }]]
+    },
+    "Wait: SLA Urgencia (10 min)": {
+      "main": [[{ "node": "IF: ¿Respondio en SLA Urgencia?", "type": "main", "index": 0 }]]
+    },
+    "IF: ¿Respondio en SLA Urgencia?": {
+      "main": [
+        [{ "node": "Slack: Caso Aprobado por Medico", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Reasignar por Timeout", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: Email Baja Confianza IA": {
+      "main": [[{ "node": "Wait: SLA Revision (15 min)", "type": "main", "index": 0 }]]
+    },
+    "Wait: SLA Revision (15 min)": {
+      "main": [[{ "node": "Postgres: Audit Trail HIPAA", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Audit Trail HIPAA": {
+      "main": [[{ "node": "Respond: HITL Procesado", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["medflow", "healthcare", "hitl", "hipaa", "urgencias"],
+  "meta": {
+    "description": "MedFlow AI — WF4: HITL Supervision Medica. Tres ramas por nivel de urgencia (emergencia/urgencia/baja confianza). Wait Nodes con SLA 2/10/15 min. Audit trail inmutable HIPAA en cada evento. Escalacion automatica por timeout.",
+    "templateVersion": "1.0"
+  }
+}

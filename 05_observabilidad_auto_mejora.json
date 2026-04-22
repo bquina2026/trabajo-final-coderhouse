@@ -1,0 +1,374 @@
+{
+  "name": "MedFlow AI — WF5: Observabilidad y Auto-mejora",
+  "nodes": [
+    {
+      "id": "schedule-domingo",
+      "name": "Schedule: Domingo 2:00 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeklyAtHour": 2,
+              "weeklyAtMinute": 0,
+              "triggerAtWeekDay": [0]
+            }
+          ]
+        }
+      },
+      "notes": "Ejecucion automatica cada domingo a las 2:00 AM. Analiza la semana y aplica mejoras."
+    },
+    {
+      "id": "postgres-metricas-semana",
+      "name": "Postgres: Metricas de la Semana",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  COUNT(*) as total_consultas,\n  AVG(eval_score) as avg_eval_score,\n  AVG(rag_avg_score) as avg_rag_score,\n  AVG(latency_ms) as avg_latencia,\n  PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) as p95_latencia,\n  SUM(tokens_input + tokens_output) as total_tokens,\n  SUM(CASE WHEN hitl_triggered THEN 1 ELSE 0 END) as total_hitl,\n  SUM(CASE WHEN error_type IS NOT NULL THEN 1 ELSE 0 END) as total_errores,\n  SUM(CASE WHEN eval_score < 6.5 THEN 1 ELSE 0 END) as respuestas_bajas\nFROM execution_logs\nWHERE timestamp >= NOW() - INTERVAL '7 days'\n  AND workflow_id = 'WF2';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "postgres-respuestas-bajas",
+      "name": "Postgres: Respuestas con Score Bajo",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 460],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  canal,\n  LEFT(respuesta_texto, 300) as respuesta_muestra,\n  rag_chunks_count,\n  rag_avg_score,\n  eval_score,\n  fuentes_citadas,\n  tiene_disclaimer\nFROM execution_logs\nWHERE timestamp >= NOW() - INTERVAL '7 days'\n  AND workflow_id = 'WF2'\n  AND eval_score < 6.5\n  AND hitl_triggered = false\nORDER BY eval_score ASC\nLIMIT 20;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "postgres-sla-hitl",
+      "name": "Postgres: Cumplimiento SLA HITL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 620],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  urgencia_tipo,\n  COUNT(*) as total,\n  SUM(CASE WHEN sla_cumplido THEN 1 ELSE 0 END) as sla_ok,\n  ROUND(100.0 * SUM(CASE WHEN sla_cumplido THEN 1 ELSE 0 END) / COUNT(*), 2) as sla_pct,\n  SUM(CASE WHEN NOT medico_respondio THEN 1 ELSE 0 END) as timeouts\nFROM audit_trail\nWHERE timestamp_trigger >= NOW() - INTERVAL '7 days'\nGROUP BY urgencia_tipo\nORDER BY urgencia_tipo;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "code-consolidar-metricas",
+      "name": "Code: Consolidar Metricas Semanales",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 460],
+      "parameters": {
+        "jsCode": "const metricas = $('Postgres: Metricas de la Semana').first().json;\nconst respuestasBajas = $('Postgres: Respuestas con Score Bajo').all().map(i => i.json);\nconst slaHITL = $('Postgres: Cumplimiento SLA HITL').all().map(i => i.json);\n\n// Calcular costo estimado OpenAI (aprox)\nconst costoEstimado = (metricas.total_tokens || 0) * 0.000005; // ~$5/1M tokens gpt-4o input\n\n// Score compuesto de salud del sistema\nconst scoreHealth = (\n  (metricas.avg_eval_score / 10) * 40 +\n  (metricas.avg_rag_score || 0.8) * 30 +\n  (metricas.p95_latencia < 8000 ? 1 : 0.5) * 20 +\n  (metricas.total_errores / Math.max(metricas.total_consultas, 1) < 0.05 ? 1 : 0.5) * 10\n);\n\n// Identificar patrones de fallo\nconst patronesFallo = [];\nif (metricas.avg_eval_score < 7) patronesFallo.push('eval_score_bajo: promedio ' + Math.round(metricas.avg_eval_score * 100) / 100);\nif (metricas.avg_rag_score < 0.75) patronesFallo.push('rag_score_bajo: promedio ' + Math.round((metricas.avg_rag_score || 0) * 100) / 100);\nif (metricas.p95_latencia > 8000) patronesFallo.push('latencia_alta: P95=' + metricas.p95_latencia + 'ms');\nif (metricas.total_errores > 0) patronesFallo.push('errores_workflow: ' + metricas.total_errores + ' esta semana');\n\nconst slaEmergencia = slaHITL.find(s => s.urgencia_tipo === 'emergencia');\nif (slaEmergencia && slaEmergencia.sla_pct < 95) {\n  patronesFallo.push('SLA_BREACH_EMERGENCIA: ' + slaEmergencia.sla_pct + '% (objetivo 95%)');\n}\n\nreturn [{\n  json: {\n    semana_inicio: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],\n    semana_fin: new Date().toISOString().split('T')[0],\n    metricas: {\n      ...metricas,\n      costo_estimado_usd: Math.round(costoEstimado * 100) / 100,\n      score_health_sistema: Math.round(scoreHealth * 10) / 10\n    },\n    respuestas_bajas_muestra: respuestasBajas.slice(0, 5),\n    sla_hitl: slaHITL,\n    patrones_fallo: patronesFallo,\n    requiere_mejora_prompt: metricas.avg_eval_score < 7.0,\n    requiere_reingestion_rag: (metricas.avg_rag_score || 0) < 0.75,\n    tiene_sla_breach_emergencia: slaEmergencia ? slaEmergencia.sla_pct < 95 : false\n  }\n}];"
+      }
+    },
+    {
+      "id": "if-requiere-mejoras",
+      "name": "IF: ¿Se Detectaron Problemas?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [920, 460],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-mejora",
+              "leftValue": "={{ $json.patrones_fallo.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "http-gpt4o-analisis",
+      "name": "HTTP: GPT-4o Analiza Fallos y Sugiere Mejoras",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 340],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.OPENAI_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "gpt-4o",
+          "max_tokens": 1000,
+          "messages": [
+            {
+              "role": "system",
+              "content": "Eres un experto en optimizacion de sistemas de IA medica. Analiza metricas de performance y sugiere mejoras ESPECIFICAS al system prompt del asistente clinico. NUNCA sugieras cambios que reduzcan la seguridad del paciente o que remuevan disclaimers medicos. Responde SOLO en JSON con estructura: { \"analisis\": \"texto\", \"mejoras_prompt\": [\"mejora1\", \"mejora2\"], \"prioridad_reingestion_rag\": true/false, \"requiere_aprobacion_humana\": true/false }"
+            },
+            {
+              "role": "user",
+              "content": "=Analiza estas metricas de MedFlow AI de la semana:\n\nPatrones de fallo detectados: {{ $json.patrones_fallo.join(', ') }}\n\nMetricas:\n- Eval score promedio: {{ $json.metricas.avg_eval_score }}\n- RAG score promedio: {{ $json.metricas.avg_rag_score }}\n- P95 latencia: {{ $json.metricas.p95_latencia }}ms\n- Total consultas: {{ $json.metricas.total_consultas }}\n- Respuestas con score < 6.5: {{ $json.metricas.respuestas_bajas }}\n\nMuestra de respuestas bajas:\n{{ JSON.stringify($json.respuestas_bajas_muestra) }}\n\nSugiere mejoras concretas al system prompt para la proxima semana."
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 3,
+            "waitBetweenTries": 3000
+          }
+        }
+      },
+      "notes": "GPT-4o actua como juez y analista. Revisa las respuestas de baja calidad y propone mejoras especificas al prompt."
+    },
+    {
+      "id": "code-parse-sugerencias",
+      "name": "Code: Parsear Sugerencias de IA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1360, 340],
+      "parameters": {
+        "jsCode": "const rawResponse = $('HTTP: GPT-4o Analiza Fallos y Sugiere Mejoras').first().json;\nconst content = rawResponse.choices?.[0]?.message?.content || '{}';\n\nlet sugerencias;\ntry {\n  sugerencias = JSON.parse(content.replace(/```json|```/g, '').trim());\n} catch (e) {\n  sugerencias = { analisis: content, mejoras_prompt: [], requiere_aprobacion_humana: true };\n}\n\nconst metricas = $('Code: Consolidar Metricas Semanales').first().json;\n\n// REGLA DE SEGURIDAD: si hay SLA breach de emergencias, siempre requiere aprobacion humana\nif (metricas.tiene_sla_breach_emergencia) {\n  sugerencias.requiere_aprobacion_humana = true;\n  sugerencias.alerta_sla = 'SLA de emergencias no cumplido - requiere revision urgente del protocolo HITL';\n}\n\nreturn [{\n  json: {\n    ...metricas,\n    sugerencias_ia: sugerencias,\n    auto_aplicar: !sugerencias.requiere_aprobacion_humana && sugerencias.mejoras_prompt?.length > 0\n  }\n}];"
+      }
+    },
+    {
+      "id": "if-auto-aplicar",
+      "name": "IF: ¿Se Puede Auto-aplicar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1580, 340],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-auto",
+              "leftValue": "={{ $json.auto_aplicar }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "postgres-actualizar-prompt",
+      "name": "Postgres: Actualizar System Prompt",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1800, 260],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE bot_config\nSET \n  system_prompt_version = system_prompt_version + 1,\n  mejoras_aplicadas = '{{ JSON.stringify($json.sugerencias_ia.mejoras_prompt) }}',\n  updated_at = NOW()\nWHERE config_key = 'asistente_clinico_wf2'\nRETURNING system_prompt_version, updated_at;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "postgres-snapshot-version",
+      "name": "Postgres: Snapshot de Version",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2020, 260],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO eval_snapshots (\n  semana_inicio, semana_fin,\n  avg_eval_score, avg_rag_score, p95_latencia,\n  patrones_fallo, mejoras_aplicadas,\n  auto_aplicado, score_health,\n  created_at\n) VALUES (\n  '{{ $json.semana_inicio }}',\n  '{{ $json.semana_fin }}',\n  {{ $json.metricas.avg_eval_score }},\n  {{ $json.metricas.avg_rag_score || 0 }},\n  {{ $json.metricas.p95_latencia || 0 }},\n  '{{ JSON.stringify($json.patrones_fallo) }}',\n  '{{ JSON.stringify($json.sugerencias_ia?.mejoras_prompt || []) }}',\n  {{ $json.auto_aplicar }},\n  {{ $json.metricas.score_health_sistema }},\n  NOW()\n);",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Guarda snapshot inmutable de cada ciclo de auto-mejora. Permite auditar la evolucion del sistema."
+    },
+    {
+      "id": "slack-reporte-medico-requerido",
+      "name": "Slack: Reporte — Aprobacion Medica Requerida",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1800, 460],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#medflow-ops",
+        "text": "🔎 *Revision Medica Requerida — Cambios NO Auto-aplicados*\n\nEl sistema de auto-mejora detecto cambios que requieren aprobacion:\n\n*Patrones de fallo:* {{ $json.patrones_fallo.join(' | ') }}\n*Analisis IA:* {{ $json.sugerencias_ia.analisis }}\n\n*Mejoras sugeridas (pendientes de aprobacion):*\n{{ $json.sugerencias_ia.mejoras_prompt?.map((m, i) => `${i+1}. ${m}`).join('\\n') || 'Sin mejoras de prompt' }}\n\n⚠️ {{ $json.sugerencias_ia.alerta_sla || 'Revisar metricas de SLA adjuntas' }}\n\nAprobar cambios en: {{ $env.HITL_PANEL_URL }}/auto-mejora"
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "slack-reporte-semanal-final",
+      "name": "Slack: Reporte Semanal Completo",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [2240, 340],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "#medflow-ops",
+        "text": "📊 *Reporte Semanal MedFlow AI*\n{{ $json.semana_inicio }} al {{ $json.semana_fin }}\n\n*Volumen:* {{ $json.metricas.total_consultas }} consultas | {{ $json.metricas.total_hitl }} escalaciones HITL\n*Calidad:* Eval Score {{ Math.round(($json.metricas.avg_eval_score || 0) * 100) / 100 }}/10 | RAG Score {{ Math.round(($json.metricas.avg_rag_score || 0) * 1000) / 1000 }}\n*Performance:* P95 Latencia {{ $json.metricas.p95_latencia }}ms\n*Costo:* USD {{ $json.metricas.costo_estimado_usd }}\n*Score Salud Sistema:* {{ $json.metricas.score_health_sistema }}/100\n*Errores:* {{ $json.metricas.total_errores }}\n\n*SLA HITL esta semana:*\n{{ $json.sla_hitl.map(s => `• ${s.urgencia_tipo}: ${s.sla_pct}% (${s.sla_ok}/${s.total})`).join('\\n') }}\n\n*Estado auto-mejora:* {{ $json.auto_aplicar ? '✅ Cambios auto-aplicados' : '⚠️ Requiere aprobacion humana' }}"
+      },
+      "credentials": {
+        "slack": {
+          "id": "slack-medflow",
+          "name": "Slack MedFlow"
+        }
+      }
+    },
+    {
+      "id": "health-check-webhook",
+      "name": "Webhook: Health Check",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 660],
+      "parameters": {
+        "path": "medflow/health",
+        "httpMethod": "GET",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "Endpoint de health check para Uptime Robot y monitoreo externo. Retorna estado del sistema."
+    },
+    {
+      "id": "postgres-health-query",
+      "name": "Postgres: Query Estado Sistema",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 660],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  COUNT(*) as consultas_ultima_hora,\n  AVG(latency_ms) as avg_latencia_1h,\n  MAX(timestamp) as ultima_ejecucion,\n  SUM(CASE WHEN error_type IS NOT NULL THEN 1 ELSE 0 END) as errores_ultima_hora\nFROM execution_logs\nWHERE timestamp >= NOW() - INTERVAL '1 hour';",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "respond-health",
+      "name": "Respond: Status del Sistema",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [680, 660],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ok', sistema: 'MedFlow AI', consultas_ultima_hora: $json.consultas_ultima_hora, avg_latencia_ms: Math.round($json.avg_latencia_1h || 0), errores_ultima_hora: $json.errores_ultima_hora, ultima_ejecucion: $json.ultima_ejecucion, timestamp: new Date().toISOString() }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Domingo 2:00 AM": {
+      "main": [
+        [
+          { "node": "Postgres: Metricas de la Semana", "type": "main", "index": 0 },
+          { "node": "Postgres: Respuestas con Score Bajo", "type": "main", "index": 0 },
+          { "node": "Postgres: Cumplimiento SLA HITL", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Postgres: Metricas de la Semana": {
+      "main": [[{ "node": "Code: Consolidar Metricas Semanales", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Respuestas con Score Bajo": {
+      "main": [[{ "node": "Code: Consolidar Metricas Semanales", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Cumplimiento SLA HITL": {
+      "main": [[{ "node": "Code: Consolidar Metricas Semanales", "type": "main", "index": 0 }]]
+    },
+    "Code: Consolidar Metricas Semanales": {
+      "main": [[{ "node": "IF: ¿Se Detectaron Problemas?", "type": "main", "index": 0 }]]
+    },
+    "IF: ¿Se Detectaron Problemas?": {
+      "main": [
+        [{ "node": "HTTP: GPT-4o Analiza Fallos y Sugiere Mejoras", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Reporte Semanal Completo", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: GPT-4o Analiza Fallos y Sugiere Mejoras": {
+      "main": [[{ "node": "Code: Parsear Sugerencias de IA", "type": "main", "index": 0 }]]
+    },
+    "Code: Parsear Sugerencias de IA": {
+      "main": [[{ "node": "IF: ¿Se Puede Auto-aplicar?", "type": "main", "index": 0 }]]
+    },
+    "IF: ¿Se Puede Auto-aplicar?": {
+      "main": [
+        [{ "node": "Postgres: Actualizar System Prompt", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Reporte — Aprobacion Medica Requerida", "type": "main", "index": 0 }]
+      ]
+    },
+    "Postgres: Actualizar System Prompt": {
+      "main": [[{ "node": "Postgres: Snapshot de Version", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Snapshot de Version": {
+      "main": [[{ "node": "Slack: Reporte Semanal Completo", "type": "main", "index": 0 }]]
+    },
+    "Slack: Reporte — Aprobacion Medica Requerida": {
+      "main": [[{ "node": "Postgres: Snapshot de Version", "type": "main", "index": 0 }]]
+    },
+    "Webhook: Health Check": {
+      "main": [[{ "node": "Postgres: Query Estado Sistema", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Query Estado Sistema": {
+      "main": [[{ "node": "Respond: Status del Sistema", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["medflow", "healthcare", "observabilidad", "auto-mejora", "metricas"],
+  "meta": {
+    "description": "MedFlow AI — WF5: Observabilidad y Auto-mejora. Schedule dominical: analiza metricas, detecta patrones de fallo, usa GPT-4o como juez, aplica mejoras de prompt automaticamente (si no requiere aprobacion medica) o escala a supervisor. Snapshot inmutable de cada ciclo. Health check endpoint incluido.",
+    "templateVersion": "1.0"
+  }
+}

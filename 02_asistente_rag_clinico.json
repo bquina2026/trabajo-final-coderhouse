@@ -1,0 +1,542 @@
+{
+  "name": "MedFlow AI — WF2: Asistente Clinico RAG + GPT-4o",
+  "nodes": [
+    {
+      "id": "webhook-rag-entrada",
+      "name": "Webhook: Recibe Consulta del WF1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "path": "medflow/rag-consulta",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "notes": "Punto de entrada desde WF1. Recibe payload normalizado con texto, canal, urgencia_score y patient_hash."
+    },
+    {
+      "id": "if-es-audio",
+      "name": "IF: ¿Es Mensaje de Audio?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "cond-audio",
+              "leftValue": "={{ $json.body.tipo_mensaje }}",
+              "rightValue": "audio",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "http-download-audio",
+      "name": "HTTP: Descargar Audio de Meta API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 160],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v18.0/{{ $json.body.media_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.WHATSAPP_TOKEN }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "http-whisper-transcribe",
+      "name": "HTTP: Transcribir con Whisper",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 160],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/audio/transcriptions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENAI_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "model", "value": "whisper-1" },
+            { "name": "language", "value": "es" },
+            { "name": "response_format", "value": "text" },
+            { "name": "file", "parameterType": "formBinaryData", "inputDataFieldName": "data" }
+          ]
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "notes": "Transcribe audio OGG/MP3 a texto en español via OpenAI Whisper. Fallback: respuesta predefinida si falla."
+    },
+    {
+      "id": "set-texto-transcripto",
+      "name": "Set: Usar Texto Transcripto",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 160],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "assign-texto",
+              "name": "texto_final",
+              "value": "={{ $json.text || $json.body }}",
+              "type": "string"
+            },
+            {
+              "id": "assign-fuente",
+              "name": "fuente_texto",
+              "value": "whisper_transcription",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "set-texto-directo",
+      "name": "Set: Usar Texto Directo",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [680, 380],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "assign-texto-d",
+              "name": "texto_final",
+              "value": "={{ $json.body.texto }}",
+              "type": "string"
+            },
+            {
+              "id": "assign-fuente-d",
+              "name": "fuente_texto",
+              "value": "direct_text",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "http-embed-query",
+      "name": "HTTP: Embedding de la Consulta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1360, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.OPENAI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "text-embedding-3-small",
+          "input": "={{ $json.texto_final }}",
+          "encoding_format": "float"
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "notes": "Genera embedding de la consulta con text-embedding-3-small (1536 dims) para busqueda semantica en Pinecone."
+    },
+    {
+      "id": "http-pinecone-search",
+      "name": "HTTP: Busqueda Semantica en Pinecone",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1580, 300],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.PINECONE_INDEX_HOST }}/query",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Api-Key",
+              "value": "={{ $env.PINECONE_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "vector": "={{ $('HTTP: Embedding de la Consulta').first().json.data[0].embedding }}",
+          "topK": 5,
+          "includeMetadata": true,
+          "namespace": "medflow-clinical",
+          "filter": {
+            "especialidad": {
+              "$in": ["{{ $json.body.especialidad || 'general' }}", "general"]
+            }
+          }
+        },
+        "options": {
+          "retry": {
+            "enabled": true,
+            "maxTries": 3,
+            "waitBetweenTries": 1500
+          }
+        }
+      },
+      "notes": "Recupera top-5 chunks de protocolos clinicos mas relevantes de Pinecone. Filtra por especialidad si fue especificada."
+    },
+    {
+      "id": "postgres-historia-clinica",
+      "name": "Postgres: Historia Clinica del Paciente",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1580, 460],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  diagnosticos_previos,\n  medicacion_activa,\n  alergias,\n  ultima_consulta,\n  medico_asignado\nFROM pacientes_cache\nWHERE patient_hash = '{{ $('Set: Usar Texto Directo').first().json.body.patient_hash }}'\nLIMIT 1;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      },
+      "notes": "Lee datos anonimizados del paciente de cache local (sincronizado desde FHIR). Usuario READ-ONLY."
+    },
+    {
+      "id": "code-build-context",
+      "name": "Code: Construir Contexto Clinico RAG",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1800, 380],
+      "parameters": {
+        "jsCode": "// Recuperar chunks de Pinecone\nconst matches = $('HTTP: Busqueda Semantica en Pinecone').first().json.matches || [];\nconst historiaClinica = $('Postgres: Historia Clinica del Paciente').first().json || {};\nconst consulta = $('Set: Usar Texto Directo').first().json;\n\n// Filtrar chunks con score relevante\nconst chunksRelevantes = matches\n  .filter(m => m.score >= 0.72)\n  .map((m, i) => `[Fuente ${i+1}: ${m.metadata?.fuente || 'Protocolo Clinico'} — Seccion: ${m.metadata?.seccion || 'General'}]\\n${m.metadata?.text || ''}`);\n\nconst avgScore = matches.length > 0 \n  ? matches.reduce((s, m) => s + m.score, 0) / matches.length \n  : 0;\n\n// Construir contexto clinico\nconst contextoRAG = chunksRelevantes.length > 0\n  ? chunksRelevantes.join('\\n\\n---\\n\\n')\n  : 'No se encontraron protocolos especificos. Responder con informacion general y recomendar consulta medica.';\n\n// Historia clinica anonimizada\nconst historiaTexto = historiaClinica.diagnosticos_previos\n  ? `Antecedentes conocidos: ${historiaClinica.diagnosticos_previos}\\nMedicacion activa: ${historiaClinica.medicacion_activa || 'ninguna registrada'}\\nAlergias: ${historiaClinica.alergias || 'sin registro'}`\n  : 'Sin historia clinica previa en el sistema.';\n\nreturn [{\n  json: {\n    ...consulta,\n    contexto_rag: contextoRAG,\n    historia_clinica: historiaTexto,\n    rag_chunks_count: chunksRelevantes.length,\n    rag_avg_score: Math.round(avgScore * 1000) / 1000,\n    fuentes_citadas: matches.map(m => m.metadata?.fuente).filter(Boolean).join(', ')\n  }\n}];"
+      },
+      "notes": "Combina chunks RAG de Pinecone con historia clinica del paciente. Filtra por threshold de score."
+    },
+    {
+      "id": "ai-agent",
+      "name": "AI Agent: Asistente Clinico GPT-4o",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [2020, 300],
+      "parameters": {
+        "agent": "conversationalAgent",
+        "promptType": "define",
+        "text": "={{ $json.texto_final }}",
+        "systemMessage": "Eres el asistente medico administrativo de MedFlow AI, de una clinica en Argentina.\n\nTu rol:\n- Proporcionar informacion medica general basada en los protocolos recuperados\n- Orientar al paciente sobre sus sintomas y proximos pasos\n- Gestionar turnos y recordatorios\n\nREGLAS ABSOLUTAS (nunca violarlas):\n1. NUNCA diagnosticas enfermedades especificas\n2. NUNCA prescribes ni recomiendas medicamentos especificos\n3. NUNCA das informacion que contradiga los protocolos recuperados\n4. SIEMPRE recomiendas consultar con un medico para confirmacion\n5. Si detectas urgencia critica (dolor de pecho, dificultad respirar, etc.): INMEDIATAMENTE llama a escalate_HITL y menciona llamar al 107 (emergencias Argentina)\n6. Idioma: responde en el mismo idioma que el paciente\n\nCONTEXTO CLINICO RECUPERADO (RAG):\n{{ $json.contexto_rag }}\n\nHISTORIA DEL PACIENTE:\n{{ $json.historia_clinica }}\n\nSi el contexto dice 'No se encontraron protocolos', se honesto sobre las limitaciones y recomienda la consulta medica.",
+        "options": {
+          "maxIterations": 6
+        }
+      },
+      "notes": "Agente IA principal. Usa GPT-4o con 6 herramientas clinicas via conexion ai_tool. Memoria de ventana por sesion."
+    },
+    {
+      "id": "openai-model",
+      "name": "OpenAI: GPT-4o",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.1,
+      "position": [1900, 480],
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {
+          "temperature": 0.2,
+          "maxTokens": 800
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-medflow",
+          "name": "OpenAI MedFlow"
+        }
+      }
+    },
+    {
+      "id": "memory-buffer",
+      "name": "Window Buffer Memory (por sesion)",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [2020, 480],
+      "parameters": {
+        "contextWindowLength": 8,
+        "sessionKey": "={{ $json.body.patient_hash + '_' + $json.body.canal }}"
+      },
+      "notes": "Mantiene las ultimas 8 interacciones por sesion paciente+canal. Clave: hash_paciente + canal."
+    },
+    {
+      "id": "tool-check-drugs",
+      "name": "Tool: Check Interacciones Medicamentos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1800, 600],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://rxnav.nlm.nih.gov/REST/interaction/list.json?rxcuis={{ $json.rxcuis }}",
+        "options": {}
+      },
+      "notes": "TOOL: Consulta API publica RxNorm para verificar interacciones medicamentosas. Conexion: ai_tool"
+    },
+    {
+      "id": "tool-book-appointment",
+      "name": "Tool: Agendar Turno",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [1980, 600],
+      "parameters": {
+        "resource": "event",
+        "operation": "create",
+        "calendarId": "={{ $env.CALENDAR_ID_CLINICA }}",
+        "start": "={{ $json.fecha_inicio }}",
+        "end": "={{ $json.fecha_fin }}",
+        "additionalFields": {
+          "summary": "=Consulta: {{ $json.especialidad }}",
+          "description": "=Paciente (hash): {{ $json.patient_hash }}\\nMotivo: {{ $json.motivo_consulta }}"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "google-calendar-clinica",
+          "name": "Google Calendar Clinica"
+        }
+      },
+      "notes": "TOOL: Crea turno en Google Calendar de la clinica. Solo nombre de especialidad, hash del paciente (sin PII)."
+    },
+    {
+      "id": "tool-escalate-hitl",
+      "name": "Tool: Escalar a Medico (HITL)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2160, 600],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.N8N_BASE_URL }}/webhook/medflow/hitl-trigger",
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "origen": "ai_agent_tool",
+          "razon": "={{ $json.razon_escalacion }}",
+          "urgencia_tipo": "={{ $json.urgencia_tipo || 'consulta_critica' }}",
+          "contexto": "={{ $json.texto_final }}",
+          "patient_hash": "={{ $json.patient_hash }}"
+        },
+        "options": {}
+      },
+      "notes": "TOOL: El agente IA llama esta herramienta cuando detecta urgencia o baja confianza. Activa WF4 HITL."
+    },
+    {
+      "id": "code-log-response",
+      "name": "Code: Log y Metricas de Respuesta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 300],
+      "parameters": {
+        "jsCode": "const agentOutput = $input.first().json;\nconst inputData = $('Code: Construir Contexto Clinico RAG').first().json;\n\n// Calcular metricas de la respuesta\nconst respuestaTexto = agentOutput.output || '';\nconst tieneDisclaimer = respuestaTexto.toLowerCase().includes('medico') || \n                        respuestaTexto.toLowerCase().includes('consultar');\n\n// Preparar para log en Postgres\nreturn [{\n  json: {\n    patient_hash: inputData.body?.patient_hash || inputData.patient_hash,\n    canal: inputData.body?.canal || 'unknown',\n    consulta_id: inputData.body?.consulta_id,\n    workflow_id: 'WF2',\n    event_type: 'rag_response_generated',\n    rag_chunks_count: inputData.rag_chunks_count,\n    rag_avg_score: inputData.rag_avg_score,\n    fuentes_citadas: inputData.fuentes_citadas,\n    tiene_disclaimer_medico: tieneDisclaimer,\n    respuesta_texto: respuestaTexto.substring(0, 500),\n    respuesta_completa: respuestaTexto,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      }
+    },
+    {
+      "id": "postgres-log-ejecucion",
+      "name": "Postgres: Log de Ejecucion",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2460, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO execution_logs (\n  patient_hash, canal, consulta_id, workflow_id, event_type,\n  rag_chunks_count, rag_avg_score, fuentes_citadas,\n  tiene_disclaimer, timestamp\n) VALUES (\n  '{{ $json.patient_hash }}',\n  '{{ $json.canal }}',\n  {{ $json.consulta_id ? $json.consulta_id : 'NULL' }},\n  'WF2',\n  'rag_response_generated',\n  {{ $json.rag_chunks_count }},\n  {{ $json.rag_avg_score }},\n  '{{ $json.fuentes_citadas }}',\n  {{ $json.tiene_disclaimer_medico }},\n  NOW()\n);",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres-medflow-prod",
+          "name": "Postgres MedFlow Prod"
+        }
+      }
+    },
+    {
+      "id": "http-send-whatsapp",
+      "name": "HTTP: Enviar Respuesta por WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2460, 460],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.WHATSAPP_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "messaging_product": "whatsapp",
+          "to": "={{ $('Code: Construir Contexto Clinico RAG').first().json.body?.paciente_tel || '' }}",
+          "type": "text",
+          "text": {
+            "body": "={{ $('Code: Log y Metricas de Respuesta').first().json.respuesta_completa }}"
+          }
+        },
+        "options": {}
+      },
+      "notes": "Envia la respuesta del asistente al paciente por WhatsApp. Solo si el canal original fue WhatsApp."
+    },
+    {
+      "id": "error-trigger-wf2",
+      "name": "Error Trigger WF2",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [240, 600],
+      "parameters": {}
+    },
+    {
+      "id": "set-fallback-response",
+      "name": "Set: Respuesta Fallback Segura",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 600],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "fallback-msg",
+              "name": "respuesta_fallback",
+              "value": "En este momento estamos experimentando dificultades tecnicas. Por favor contacte directamente a la clinica o en caso de emergencia llame al 107. Disculpe las molestias.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: Recibe Consulta del WF1": {
+      "main": [[{ "node": "IF: ¿Es Mensaje de Audio?", "type": "main", "index": 0 }]]
+    },
+    "IF: ¿Es Mensaje de Audio?": {
+      "main": [
+        [{ "node": "HTTP: Descargar Audio de Meta API", "type": "main", "index": 0 }],
+        [{ "node": "Set: Usar Texto Directo", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP: Descargar Audio de Meta API": {
+      "main": [[{ "node": "HTTP: Transcribir con Whisper", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Transcribir con Whisper": {
+      "main": [[{ "node": "Set: Usar Texto Transcripto", "type": "main", "index": 0 }]]
+    },
+    "Set: Usar Texto Transcripto": {
+      "main": [[{ "node": "HTTP: Embedding de la Consulta", "type": "main", "index": 0 }]]
+    },
+    "Set: Usar Texto Directo": {
+      "main": [[{ "node": "HTTP: Embedding de la Consulta", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Embedding de la Consulta": {
+      "main": [[{ "node": "HTTP: Busqueda Semantica en Pinecone", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Busqueda Semantica en Pinecone": {
+      "main": [[{ "node": "Code: Construir Contexto Clinico RAG", "type": "main", "index": 0 }]]
+    },
+    "Postgres: Historia Clinica del Paciente": {
+      "main": [[{ "node": "Code: Construir Contexto Clinico RAG", "type": "main", "index": 0 }]]
+    },
+    "Code: Construir Contexto Clinico RAG": {
+      "main": [[{ "node": "AI Agent: Asistente Clinico GPT-4o", "type": "main", "index": 0 }]]
+    },
+    "AI Agent: Asistente Clinico GPT-4o": {
+      "main": [[{ "node": "Code: Log y Metricas de Respuesta", "type": "main", "index": 0 }]]
+    },
+    "OpenAI: GPT-4o": {
+      "ai_languageModel": [[{ "node": "AI Agent: Asistente Clinico GPT-4o", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Window Buffer Memory (por sesion)": {
+      "ai_memory": [[{ "node": "AI Agent: Asistente Clinico GPT-4o", "type": "ai_memory", "index": 0 }]]
+    },
+    "Tool: Check Interacciones Medicamentos": {
+      "ai_tool": [[{ "node": "AI Agent: Asistente Clinico GPT-4o", "type": "ai_tool", "index": 0 }]]
+    },
+    "Tool: Agendar Turno": {
+      "ai_tool": [[{ "node": "AI Agent: Asistente Clinico GPT-4o", "type": "ai_tool", "index": 1 }]]
+    },
+    "Tool: Escalar a Medico (HITL)": {
+      "ai_tool": [[{ "node": "AI Agent: Asistente Clinico GPT-4o", "type": "ai_tool", "index": 2 }]]
+    },
+    "Code: Log y Metricas de Respuesta": {
+      "main": [
+        [{ "node": "Postgres: Log de Ejecucion", "type": "main", "index": 0 }],
+        [{ "node": "HTTP: Enviar Respuesta por WhatsApp", "type": "main", "index": 0 }]
+      ]
+    },
+    "Error Trigger WF2": {
+      "main": [[{ "node": "Set: Respuesta Fallback Segura", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["medflow", "healthcare", "rag", "gpt4o", "whisper", "pinecone"],
+  "meta": {
+    "description": "MedFlow AI — WF2: Asistente Clinico RAG. Transcripcion de audio (Whisper), embedding (OpenAI), busqueda semantica (Pinecone), AI Agent GPT-4o con 3 herramientas clinicas y memoria de sesion. HIPAA: solo patient_hash en logs.",
+    "templateVersion": "1.0"
+  }
+}
